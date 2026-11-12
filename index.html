@@ -9,6 +9,9 @@
     #reverse {
       white-space: pre-wrap;
       color: magenta;
+      line-height: 1.5;
+      position: relative;
+      z-index: 1;
     }
     #source {
       outline: none;
@@ -43,14 +46,22 @@
       background: #66ff00;
       color: magenta;
     }
-    ::highlight(mirror) {
+    #mirror-overlay {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 0;
+    }
+    #mirror-overlay i {
+      position: absolute;
+      display: block;
       background: #66ff00;
-      color: magenta;
     }
   </style>
 </head>
 <body>
 <span id="source" contenteditable="true" class="empty" data-placeholder="→ y◎u should type here if y⁕u want..."></span><span id="reverse" contenteditable="true"></span>
+<div id="mirror-overlay" aria-hidden="true"></div>
 <script>
   const source = document.getElementById("source");
   const reverse = document.getElementById("reverse");
@@ -88,6 +99,58 @@
   }
 
   let syncing = false;
+  const overlay = document.getElementById("mirror-overlay");
+
+  function isBlockLike(node) {
+    return (
+      node &&
+      node.nodeType === Node.ELEMENT_NODE &&
+      /^(DIV|P|LI|H[1-6]|TR|BLOCKQUOTE|PRE|SECTION|ARTICLE|HEADER|FOOTER|UL|OL|TABLE|THEAD|TBODY|TFOOT)$/.test(
+        node.tagName
+      )
+    );
+  }
+
+  function scanPlainText(root, onText, onBreak) {
+    function walk(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        onText(node);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (node.tagName === "BR") {
+        onBreak();
+        return;
+      }
+      for (let i = 0; i < node.childNodes.length; i++) {
+        const child = node.childNodes[i];
+        const prev = i > 0 ? node.childNodes[i - 1] : null;
+        if (prev && (isBlockLike(prev) || isBlockLike(child))) onBreak();
+        walk(child);
+      }
+    }
+    walk(root);
+  }
+
+  function plainTextInfo(root) {
+    let text = "";
+    const pieces = [];
+    scanPlainText(
+      root,
+      (node) => {
+        pieces.push({
+          node,
+          start: text.length,
+          end: text.length + node.data.length,
+        });
+        text += node.data;
+      },
+      () => {
+        text += "\n";
+      }
+    );
+    return { text, pieces };
+  }
 
   function lineSegments(text) {
     const segments = [];
@@ -137,54 +200,118 @@
     return { first, last, count: words.length };
   }
 
+  function offsetAt(root, targetNode, targetOffset) {
+    if (!root.contains(targetNode) && root !== targetNode) return 0;
+    let pos = 0;
+    let found = false;
+
+    function walk(node) {
+      if (found) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node === targetNode) {
+          pos += Math.min(targetOffset, node.data.length);
+          found = true;
+        } else {
+          pos += node.data.length;
+        }
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (node.tagName === "BR") {
+        if (node === targetNode) {
+          found = true;
+          return;
+        }
+        pos += 1;
+        return;
+      }
+      for (let i = 0; i < node.childNodes.length; i++) {
+        if (node === targetNode && i === targetOffset) {
+          found = true;
+          return;
+        }
+        const child = node.childNodes[i];
+        const prev = i > 0 ? node.childNodes[i - 1] : null;
+        if (prev && (isBlockLike(prev) || isBlockLike(child))) pos += 1;
+        walk(child);
+        if (found) return;
+      }
+      if (node === targetNode) found = true;
+    }
+
+    walk(root);
+    return pos;
+  }
+
   function getSelectionOffsets(container) {
     const selection = window.getSelection();
     if (!selection.rangeCount) return null;
     const range = selection.getRangeAt(0);
     if (!container.contains(range.commonAncestorContainer)) return null;
-    const before = range.cloneRange();
-    before.selectNodeContents(container);
-    before.setEnd(range.startContainer, range.startOffset);
-    const start = before.toString().length;
-    const end = start + range.toString().length;
+    const start = offsetAt(container, range.startContainer, range.startOffset);
+    const end = offsetAt(container, range.endContainer, range.endOffset);
     return { start, end };
+  }
+
+  function pointFromOffset(pieces, pos, isEnd) {
+    for (const piece of pieces) {
+      if (!isEnd && pos >= piece.start && pos < piece.end) {
+        return [piece.node, pos - piece.start];
+      }
+      if (isEnd && pos > piece.start && pos <= piece.end) {
+        return [piece.node, pos - piece.start];
+      }
+    }
+    if (!isEnd) {
+      for (const piece of pieces) {
+        if (piece.start >= pos) return [piece.node, 0];
+      }
+    } else {
+      for (let i = pieces.length - 1; i >= 0; i--) {
+        if (pieces[i].end <= pos) {
+          return [pieces[i].node, pieces[i].node.data.length];
+        }
+      }
+    }
+    return null;
   }
 
   function rangeFromOffsets(root, start, end) {
     if (start >= end) return null;
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-    let index = 0;
-    let startNode;
-    let startOffset;
-    let endNode;
-    let endOffset;
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const length = node.length;
-      if (!startNode && index + length > start) {
-        startNode = node;
-        startOffset = start - index;
-      }
-      if (index + length >= end) {
-        endNode = node;
-        endOffset = end - index;
-        break;
-      }
-      index += length;
-    }
-    if (!startNode || !endNode) return null;
+    const { pieces } = plainTextInfo(root);
+    const startPoint = pointFromOffset(pieces, start, false);
+    const endPoint = pointFromOffset(pieces, end, true);
+    if (!startPoint || !endPoint) return null;
     const range = document.createRange();
-    range.setStart(startNode, startOffset);
-    range.setEnd(endNode, endOffset);
+    range.setStart(startPoint[0], startPoint[1]);
+    range.setEnd(endPoint[0], endPoint[1]);
     return range;
   }
 
   function clearMirrorHighlight() {
-    if (window.CSS?.highlights) CSS.highlights.delete("mirror");
+    overlay.replaceChildren();
+  }
+
+  function paintRanges(ranges, host) {
+    clearMirrorHighlight();
+    const lineHeight = parseFloat(getComputedStyle(host).lineHeight);
+    for (const range of ranges) {
+      for (const rect of range.getClientRects()) {
+        if (!rect.width || !rect.height) continue;
+        const height = lineHeight > rect.height ? lineHeight : rect.height;
+        const top = rect.top - (height - rect.height) / 2;
+        const mark = document.createElement("i");
+        mark.style.left = `${rect.left}px`;
+        mark.style.top = `${top}px`;
+        mark.style.width = `${rect.width}px`;
+        mark.style.height = `${height}px`;
+        overlay.appendChild(mark);
+      }
+    }
   }
 
   function updateMirrorHighlight() {
-    if (syncing || !window.CSS?.highlights) {
+    if (syncing) {
       clearMirrorHighlight();
       return;
     }
@@ -215,10 +342,11 @@
       return;
     }
 
-    const activeSegments = lineSegments(active.innerText);
-    const mirrorSegments = lineSegments(mirror.innerText);
-    const mirrorHighlight = new Highlight();
-    let matched = false;
+    const activeText = plainTextInfo(active).text;
+    const mirrorText = plainTextInfo(mirror).text;
+    const activeSegments = lineSegments(activeText);
+    const mirrorSegments = lineSegments(mirrorText);
+    const ranges = [];
 
     for (const segment of activeSegments) {
       if (segment.end <= offsets.start || segment.start >= offsets.end) continue;
@@ -244,13 +372,10 @@
         mirrorSegment.start + mirrorStart,
         mirrorSegment.start + mirrorEnd
       );
-      if (range) {
-        mirrorHighlight.add(range);
-        matched = true;
-      }
+      if (range) ranges.push(range);
     }
 
-    if (matched) CSS.highlights.set("mirror", mirrorHighlight);
+    if (ranges.length) paintRanges(ranges, mirror);
     else clearMirrorHighlight();
   }
 
@@ -272,9 +397,21 @@
     syncing = false;
   }
 
+  function pastePlainText(e) {
+    e.preventDefault();
+    const text = e.clipboardData.getData("text/plain");
+    const target = e.currentTarget;
+    target.focus();
+    document.execCommand("insertText", false, text);
+  }
+
+  source.addEventListener("paste", pastePlainText);
+  reverse.addEventListener("paste", pastePlainText);
   source.addEventListener("input", renderFromSource);
   reverse.addEventListener("input", renderFromReverse);
   document.addEventListener("selectionchange", updateMirrorHighlight);
+  window.addEventListener("scroll", updateMirrorHighlight, true);
+  window.addEventListener("resize", updateMirrorHighlight);
 
   source.focus();
   renderFromSource();
